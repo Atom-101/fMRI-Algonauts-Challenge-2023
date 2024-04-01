@@ -10,7 +10,7 @@ sbatch << EOT
 #SBATCH -N 1                    # Force single node
 #SBATCH --time 30:00:00         # Runtime in D-HH:MM, minimum of 10 minutes
 #SBATCH --partition g40x         # Partition to submit to
-#SBATCH --gpus 2        # Number of GPUs
+#SBATCH --gpus 1        # Number of GPUs
 #SBATCH --mem 64000         # Memory pool for all cores (see also --mem-per-cpu)
 #SBATCH -o ../train_logs/slurm/$2.out  # %j inserts jobid
 #SBATCH -e ../train_logs/slurm/$2.err  # %j inserts jobid

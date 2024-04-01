@@ -38,9 +38,43 @@ for arg in "$@"; do
     #     echo "Input is equal to 1. Running prior_fwd_bn_hialph"
     #     bash run_train2.sh train_forward_prior.py prior_fwd_bn_hialph --bidir_mixco --wandb_log
 
+    # if [[ $arg -eq 1 ]]; then
+    #     echo "Input is equal to 1. Running prior_bwd_normfwd"
+    #     bash run_train2.sh train_s3.py prior_bwd_normfwd --train_rev_v2c --num_epochs 300
+    
     if [[ $arg -eq 1 ]]; then
-        echo "Input is equal to 1. Running prior_bwd_normfwd"
-        bash run_train2.sh train_s3.py prior_bwd_normfwd --train_rev_v2c --num_epochs 300
+        echo "Input is equal to 1. Running mlp_fpn"
+        bash run_train2.sh train_mlp.py mlp_fpn --num_epochs 300
+    elif [[ $arg -eq 2 ]]; then
+        echo "Input is equal to 2. Running mlp_fpn_hidrop"
+        bash run_train2.sh train_mlp.py mlp_fpn_hidrop --num_epochs 300
+    elif [[ $arg -eq 3 ]]; then
+        echo "Input is equal to 3. Running mlp_fpn_mixer"
+        bash run_train2.sh train_mlp.py mlp_fpn_mixer --num_epochs 300 --use_token_mixer
+    elif [[ $arg -eq 4 ]]; then
+        echo "Input is equal to 4. Running mlp_fpn_cls_corrloss"
+        bash run_train2.sh train_mlp.py mlp_fpn_cls_corrloss --num_epochs 300 --only_cls --n_blocks 0
+    elif [[ $arg -eq 5 ]]; then
+        echo "Input is equal to 5. Running prior_bwd_normfwd_corrloss"
+        bash run_train2.sh train_s3.py prior_bwd_normfwd_corrloss --train_rev_v2c --num_epochs 300
+
+    elif [[ $arg -eq 6 ]]; then
+        echo "Input is equal to 6. Running mlp_fpn_cls_corrloss_voxelbatch"
+        bash run_train2.sh train_mlp.py mlp_fpn_cls_corrloss_voxelbatch --num_epochs 300 --only_cls --n_blocks 0 --voxel_batch 0
+
+    elif [[ $arg -eq 7 ]]; then
+        echo "Input is equal to 7. Running eeg_prior"
+        bash run_train2.sh train_forward_prior_eeg.py eeg_prior_conv_nomix --bidir_mixco --wandb_log --mixup_pct 0
+    elif [[ $arg -eq 8 ]]; then
+        echo "Input is equal to 8. Running eeg_prior"
+        bash run_train2.sh train_forward_prior_eeg.py eeg_prior_conv_nomix_sd2 --bidir_mixco --wandb_log --mixup_pct 0 --no_versatile
+
+     elif [[ $arg -eq 9 ]]; then
+        echo "Input is equal to 9. Running eeg_prior_mbd"
+        bash run_train2.sh train_forward_prior_eeg.py eeg_prior_mbd_conv_nomix_sd --bidir_mixco --wandb_log --mixup_pct 0 --no_versatile --subj_id=mbd --num_epochs 300
+    elif [[ $arg -eq 10 ]]; then
+        echo "Input is equal to 10. Running eeg_prior_mbd_oldnet"
+        bash run_train2.sh train_forward_prior_eeg.py eeg_prior_mbd_oldnet --bidir_mixco --wandb_log --mixup_pct 0 --no_versatile --subj_id=mbd --num_epochs 300
     
     else
         echo "Invalid input. Ignoring argument $arg."

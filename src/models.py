@@ -198,6 +198,71 @@ class Clipper(torch.nn.Module):
         txt = txt.flatten()
         return self.embed_text(txt)
 
+class HiddenClipper(Clipper):
+    def __init__(self, clip_variant, train_transforms=None, device=torch.device('cpu')):
+        torch.nn.Module.__init__(self)
+        assert clip_variant in ("RN50", "ViT-L/14", "ViT-B/32", "RN50x64"), \
+            "clip_variant must be one of RN50, ViT-L/14, ViT-B/32, RN50x64"
+        print(clip_variant, device)
+        
+        if clip_variant=="ViT-L/14":
+            # from transformers import CLIPVisionModelWithProjection
+            # image_encoder = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14",cache_dir="/fsx/proj-medarc/fmri/cache")
+            from transformers import CLIPVisionModelWithProjection
+            sd_cache_dir = '/fsx/proj-fmri/shared/cache/models--shi-labs--versatile-diffusion/snapshots/2926f8e11ea526b562cd592b099fcf9c2985d0b7'
+            image_encoder = CLIPVisionModelWithProjection.from_pretrained(sd_cache_dir, subfolder='image_encoder', 
+                                                                          output_hidden_states=True).to(device)
+            image_encoder.eval()
+            image_encoder.requires_grad_(False)
+            self.image_encoder = image_encoder
+        else:
+            raise NotImplementedError()
+            # Hook VisionTransformer class in CLIP
+            # clip_model, preprocess = clip.load(clip_variant, device=device)
+            # clip_model.eval() # dont want to train model
+            # for param in clip_model.parameters():
+            #     param.requires_grad = False # dont need to calculate gradients        
+            # self.clip = clip_model
+        
+        self.clip_variant = clip_variant
+        if clip_variant == "RN50x64":
+            self.clip_size = (448,448)
+        else:
+            self.clip_size = (224,224)
+            
+        self.mean = np.array([0.48145466, 0.4578275, 0.40821073])
+        self.std = np.array([0.26862954, 0.26130258, 0.27577711])
+        self.normalize = transforms.Normalize(self.mean, self.std)
+        self.denormalize = transforms.Normalize((-self.mean / self.std).tolist(), (1.0 / self.std).tolist())
+
+        self.transforms = train_transforms
+        self.device= device
+    
+    @torch.no_grad()
+    def embed_image(self, image, apply_transforms=True, apply_spatial_transforms=True):
+        """Expects images in -1 to 1 range"""
+        if self.transforms is not None and apply_transforms:
+            if isinstance(self.transforms, list):
+                # clip_emb = self.transforms[0](image.cpu())
+                clip_emb = self.transforms[0](image)
+                if apply_spatial_transforms:
+                    # clip_emb = self.transforms[1](clip_emb.cpu())
+                    clip_emb = self.transforms[1](clip_emb)
+            else:
+                clip_emb = self.transforms(image)
+        else:
+            clip_emb = image
+        clip_emb = self.resize_image(clip_emb.to(self.device))
+        clip_emb = self.normalize(clip_emb)
+        
+        if self.clip_variant=="ViT-L/14":
+            clip_emb = self.image_encoder(clip_emb)
+            all_clip_emb = torch.stack(clip_emb.hidden_states[1:], dim=1)  # b,24,257,1024
+            return all_clip_emb
+        return
+        
+        
+
 class OpenClipper(Clipper):
     def __init__(self, clip_variant, weights_path, clamp_embs=False, norm_embs=False, train_transforms=None, device=torch.device('cpu')):
         torch.nn.Module.__init__(self)
@@ -571,6 +636,7 @@ class BrainDiffusionPrior(DiffusionPrior):
     def __init__(self, *args, **kwargs):
         voxel2clip = kwargs.pop('voxel2clip', None)
         pre_noise_norm = kwargs.pop('pre_noise_norm', None)
+        versatile = kwargs.pop('versatile', None)
         super().__init__(*args, **kwargs)
         self.voxel2clip = voxel2clip
         if pre_noise_norm == 'bn':
@@ -582,6 +648,7 @@ class BrainDiffusionPrior(DiffusionPrior):
             raise ValueError()
         else:
             self.pre_noise_norm = None
+        self.versatile = versatile
 
     @torch.no_grad()
     def p_sample(self, x, t, text_cond = None, self_cond = None, clip_denoised = True, cond_scale = 1.,
@@ -635,6 +702,11 @@ class BrainDiffusionPrior(DiffusionPrior):
         image_embed_noisy = self.noise_scheduler.q_sample(x_start = image_embed, t = times, noise = noise)
 
         self_cond = None
+        if not self.versatile:
+            image_embed = image_embed[:, 0]
+            image_embed_noisy = image_embed_noisy[:, 0]
+            for k,v in text_cond.items():
+                text_cond[k] = v[:, 0]
         if self.net.self_cond and random.random() < 0.5:
             with torch.no_grad():
                 self_cond = self.net(image_embed_noisy, times, **text_cond).detach()
@@ -659,6 +731,8 @@ class BrainDiffusionPrior(DiffusionPrior):
             target = noise
 
         loss = self.noise_scheduler.loss_fn(pred, target)
+        if not self.versatile:
+            pred = pred[:, None]
         return loss, pred
 
     def forward(
@@ -1374,5 +1448,481 @@ class C2VBrainDiffusionPrior(BrainDiffusionPrior):
         # return denormalized pred, diff model learns to predict normalized pred
         return loss, pred
 
+class StochasticDepth(torch.nn.Module):
+    def __init__(self, module: torch.nn.Module, p: float = 0.5):
+        super().__init__()
+        if not 0 < p < 1:
+            raise ValueError(
+                "Stochastic Depth p has to be between 0 and 1 but got {}".format(p)
+            )
+        self.module: torch.nn.Module = module
+        self.p: float = p
+        self._sampler = torch.Tensor(1)
+
+    def forward(self, inputs):
+        if self.training and self._sampler.uniform_():
+            return 0
+        return self.p * self.module(inputs)
+
+class BrainNetworkFPN(nn.Module):
+    def __init__(self, out_dim=1024, encoder_tokens=257, clip_depth=24, in_dim=15724, h=2304, 
+                 n_blocks=0, norm_type='bn', act_first=True, token_mixer=False):
+        super().__init__()
+        norm_func = partial(nn.BatchNorm1d, num_features=h) if norm_type == 'bn' else partial(nn.LayerNorm, normalized_shape=h)
+        act_fn = partial(nn.ReLU, inplace=True) if norm_type == 'bn' else nn.GELU
+        act_and_norm = (act_fn, norm_func) if act_first else (norm_func, act_fn)
+        
+        self.patch_projector = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(clip_depth*out_dim, h),
+            *[item() for item in act_and_norm],
+            nn.Dropout(0.35),
+        )
+        
+        self.token_mixer = token_mixer
+        if self.token_mixer:
+            self.token_projector = nn.Sequential(
+                nn.Linear(encoder_tokens, 32),
+                act_fn()
+            )
+            self.lin0 = nn.Sequential(
+                nn.Linear(h*32, h),
+                *[item() for item in act_and_norm],
+                nn.Dropout(0.5),
+            )
+        else:
+            self.lin0 = nn.Sequential(
+                nn.Linear(h*encoder_tokens, h),
+                *[item() for item in act_and_norm],
+                nn.Dropout(0.5),
+            )
+        
+        self.mlp = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(h, h),
+                    *[item() for item in act_and_norm],
+                    nn.Dropout(0.35)
+                )
+            for _ in range(n_blocks)
+        ])
+        
+        self.lin1 = nn.Linear(h, in_dim, bias=True)
+        self.n_blocks = n_blocks
+        
+    def forward(self, x):
+        x = x.permute(0,2,1,3).flatten(2)
+        x = self.patch_projector(x)  # bs, 257, h
+        if self.token_mixer:
+            x = self.token_projector(x.permute(0,2,1)).permute(0,2,1)  # bs, 32, h
+
+        x = self.lin0(x.flatten(1))  # bs, s.h
+        residual = x
+        for res_block in range(self.n_blocks):
+            x = self.mlp[res_block](x)
+            x += residual
+            residual = x
+        x = x.reshape(len(x), -1)
+        x = self.lin1(x)
+        return x
 
 
+class BrainNetworkEEG(nn.Module):
+    def __init__(self, out_dim=768, h=4096, n_blocks=4, norm_type='bn', act_first=True, 
+                encoder_tokens=257, decoder_tokens=257, use_projector=False, in_channels=128, **kwargs):
+        super().__init__()
+        norm_func = partial(nn.BatchNorm1d, num_features=h) if norm_type == 'bn' else partial(nn.LayerNorm, normalized_shape=h)
+        act_fn = partial(nn.ReLU, inplace=True) if norm_type == 'bn' else nn.GELU
+        act_and_norm = (act_fn, norm_func) if act_first else (norm_func, act_fn)
+        self.conv0 = nn.Sequential(
+            nn.Conv1d(in_channels, 512, 8, 4, bias=False),
+            nn.GroupNorm(1, 512),
+            nn.GELU(),
+            nn.Conv1d(512, 2048, 8, 2, bias=False),
+            nn.GroupNorm(1, 2048),
+            nn.GELU(),
+            nn.Conv1d(2048, 4096, 8, 1, bias=False),
+            nn.GroupNorm(1, 4096),
+            nn.GELU(),
+            nn.Conv1d(4096, 4096, 8, 1, bias=False),
+            nn.GroupNorm(1, 4096),
+            nn.GELU()
+        )
+        self.lin0 = nn.Sequential(
+            nn.Linear(4096, h, bias=False),
+            nn.LayerNorm(h),
+            nn.GELU(),
+            nn.Dropout(0.5)
+        )
+        
+        self.mlp = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(h, h),
+                *[item() for item in act_and_norm],
+                nn.Dropout(0.15)
+            ) for _ in range(n_blocks)
+        ])
+        
+        self.lin1 = nn.Linear(h, encoder_tokens*out_dim, bias=True)
+        self.n_blocks = n_blocks
+
+        self.encoder_tokens = encoder_tokens
+        
+        self.use_projector = use_projector
+        if use_projector:
+            self.projector = nn.Sequential(
+                nn.LayerNorm(out_dim),
+                nn.GELU(),
+                nn.Linear(out_dim, 2048),
+                nn.LayerNorm(2048),
+                nn.GELU(),
+                nn.Linear(2048, 2048),
+                nn.LayerNorm(2048),
+                nn.GELU(),
+                nn.Linear(2048, out_dim)
+            )
+        
+    def forward(self, x):
+        x = self.conv0(x)  # bs, h
+        x = self.lin0(x.mean(-1))
+        residual = x
+        for res_block in range(self.n_blocks):
+            x = self.mlp[res_block](x)
+            x += residual
+            residual = x
+        x = x.reshape(len(x), -1)
+        x = self.lin1(x)
+        
+        x = x.reshape(x.shape[0], self.encoder_tokens, -1)
+        # if self.encoder_tokens == 1:
+        #     x = x.squeeze(1)
+        if self.use_projector:
+            return x, self.projector(x)
+        return x
+
+class BrainNetworkMBDEEG(nn.Module):
+    def __init__(self, out_dim=768, h=4096, n_blocks=4, norm_type='bn', act_first=True, 
+                encoder_tokens=257, decoder_tokens=257, use_projector=False, **kwargs):
+        super().__init__()
+        norm_func = partial(nn.BatchNorm1d, num_features=h) if norm_type == 'bn' else partial(nn.LayerNorm, normalized_shape=h)
+        act_fn = partial(nn.ReLU, inplace=True) if norm_type == 'bn' else nn.GELU
+        act_and_norm = (act_fn, norm_func) if act_first else (norm_func, act_fn)
+        self.conv0 = nn.Sequential(
+            nn.Conv1d(5, 512, 32, 4, bias=False),  #256 -> 57
+            nn.GroupNorm(1, 512),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Conv1d(512, 2048, 8, 1, bias=False),  #57 -> 50
+            nn.GroupNorm(1, 2048),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Conv1d(2048, 4096, 8, 1, bias=False),  #50 -> 43
+            nn.GroupNorm(1, 4096),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Conv1d(4096, 4096, 8, 1, bias=False),  #43 -> 36
+            nn.GroupNorm(1, 4096),
+            nn.GELU(),
+        )
+        self.lin0 = nn.Sequential(
+            nn.Linear(4096, h, bias=False),
+            nn.LayerNorm(h),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(h, encoder_tokens*out_dim, bias=True)
+        )
+
+        self.n_blocks = n_blocks
+        self.encoder_tokens = encoder_tokens
+        
+        self.use_projector = use_projector
+        if use_projector:
+            self.projector = nn.Sequential(
+                nn.LayerNorm(out_dim),
+                nn.GELU(),
+                nn.Linear(out_dim, 2048),
+                nn.LayerNorm(2048),
+                nn.GELU(),
+                nn.Linear(2048, 2048),
+                nn.LayerNorm(2048),
+                nn.GELU(),
+                nn.Linear(2048, out_dim)
+            )
+        
+    def forward(self, x):
+        x = self.conv0(x)  # bs, h
+        x = self.lin0(x.mean(-1))
+
+        x = x.reshape(x.shape[0], self.encoder_tokens, -1)
+        if self.use_projector:
+            return x, self.projector(x)
+        return x
+
+
+class BrainNetworkMnistEEG(nn.Module):
+    def __init__(self, out_dim=64, h=768, encoder_tokens=4, norm_type='ln', big=False, **kwargs):
+        super().__init__()
+        # norm_func = partial(nn.BatchNorm1d, num_features=h) if norm_type == 'bn' else partial(nn.LayerNorm, normalized_shape=h)
+        if not big:
+            self.conv0 = nn.Sequential(
+                nn.Conv1d(128, 128, 10, 5, bias=False),  #500 -> 98
+                nn.GroupNorm(1, 128),
+                nn.GELU(),
+                nn.Dropout(0.2),
+                nn.Conv1d(128, 128, 3, 2, bias=False),  #98 -> 47
+                nn.GroupNorm(1, 128),
+                nn.GELU(),
+                nn.Dropout(0.2),
+                nn.Conv1d(128, 128, 3, 2, bias=False),  #47 -> 22
+                nn.GroupNorm(1, 128),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Conv1d(128, 128, 3, 2, bias=False),  #22 -> 9
+                nn.GroupNorm(1, 128),
+                nn.GELU(),
+                # nn.Dropout(0.1),
+                # nn.Conv1d(512, 512, 3, 2, bias=False),  #9 -> 3
+                # nn.GroupNorm(1, 512),
+                # nn.GELU(),
+            )
+            self.lin0 = nn.Sequential(
+                nn.Dropout(0.2),
+                # nn.Linear(512, h, bias=False),
+                # nn.LayerNorm(h),
+                # nn.GELU(),
+                # nn.Dropout(0.2),
+                nn.Linear(h, encoder_tokens*out_dim, bias=True)
+            )
+        else:
+            self.conv0 = nn.Sequential(
+                nn.Conv1d(128, 512, 8, 4, bias=False),  #500 -> 123
+                nn.GroupNorm(1, 512),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Conv1d(512, 512, 8, 2, bias=False),  #123 -> 57
+                nn.GroupNorm(1, 512),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Conv1d(512, 1024, 8, 2, bias=False),  #57 -> 24
+                nn.GroupNorm(1, 1024),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Conv1d(1024, 1024, 8, 2, bias=False),  #24 -> 8
+                nn.GroupNorm(1, 1024),
+                nn.GELU()
+            )
+            self.lin0 = nn.Sequential(
+                nn.Dropout(0.2),
+                nn.Linear(1024, h, bias=False),
+                nn.LayerNorm(h),
+                nn.GELU(),
+                nn.Dropout(0.2),
+                nn.Linear(h, encoder_tokens*out_dim, bias=True)
+            )
+
+        self.encoder_tokens = encoder_tokens
+
+        hidden_dims = [32, 48, 48, 64]
+        modules = []
+        for i in range(len(hidden_dims)-1, 0, -1):
+            modules.append(
+                nn.Sequential(
+                    nn.ConvTranspose2d(hidden_dims[i],
+                                       hidden_dims[i - 1],
+                                       kernel_size=3,
+                                       stride = 2,
+                                       padding=1,
+                                       output_padding=1),
+                    nn.BatchNorm2d(hidden_dims[i - 1]),
+                    nn.LeakyReLU())
+            )
+
+        self.decoder = nn.Sequential(*modules)
+
+        self.final_layer = nn.Sequential(
+                            nn.ConvTranspose2d(hidden_dims[0],
+                                               hidden_dims[0],
+                                               kernel_size=3,
+                                               stride=2,
+                                               padding=1,
+                                               output_padding=1),
+                            nn.BatchNorm2d(hidden_dims[0]),
+                            nn.LeakyReLU(),
+                            nn.Conv2d(hidden_dims[0], out_channels=1,
+                                      kernel_size= 3, padding= 1),
+                            nn.Tanh())
+        
+    def forward(self, x, return_enc=False):
+        x = self.conv0(x)  # bs, 512, 5
+        x = self.lin0(x.mean(-1))  # bs, 256
+        x = x.reshape(x.shape[0], -1, 2, 2)  # bs, 64, 2, 2
+        
+        dec = self.final_layer(self.decoder(x))
+
+        if return_enc:
+            return dec, x
+        return dec
+
+class VanillaVAE(nn.Module):
+
+
+    def __init__(self,
+                 in_channels: int,
+                 latent_dim: int,
+                 hidden_dims: List = None,
+                 **kwargs) -> None:
+        super(VanillaVAE, self).__init__()
+
+        self.latent_dim = latent_dim
+        self.in_channels = in_channels
+
+        modules = []
+        self.hidden_dims = hidden_dims
+        if self.hidden_dims is None:
+            self.hidden_dims = [32, 64, 128, 256, 512]
+
+        # Build Encoder
+        for h_dim in self.hidden_dims:
+            modules.append(
+                nn.Sequential(
+                    nn.Conv2d(in_channels, out_channels=h_dim,
+                              kernel_size= 3, stride= 2, padding  = 1),
+                    nn.BatchNorm2d(h_dim),
+                    nn.LeakyReLU())
+            )
+            in_channels = h_dim
+
+        self.encoder = nn.Sequential(*modules)
+        self.fc_mu = nn.Linear(self.hidden_dims[-1]*4, latent_dim)
+        self.fc_var = nn.Linear(self.hidden_dims[-1]*4, latent_dim)
+
+
+        # Build Decoder
+        modules = []
+
+        self.decoder_input = nn.Linear(latent_dim, self.hidden_dims[-1] * 4)
+
+        for i in range(len(self.hidden_dims)-1, 0, -1):
+            modules.append(
+                nn.Sequential(
+                    nn.ConvTranspose2d(self.hidden_dims[i],
+                                       self.hidden_dims[i - 1],
+                                       kernel_size=3,
+                                       stride = 2,
+                                       padding=1,
+                                       output_padding=1),
+                    nn.BatchNorm2d(self.hidden_dims[i - 1]),
+                    nn.LeakyReLU())
+            )
+
+        self.decoder = nn.Sequential(*modules)
+
+        self.final_layer = nn.Sequential(
+                            nn.ConvTranspose2d(self.hidden_dims[0],
+                                               self.hidden_dims[0],
+                                               kernel_size=3,
+                                               stride=2,
+                                               padding=1,
+                                               output_padding=1),
+                            nn.BatchNorm2d(self.hidden_dims[0]),
+                            nn.LeakyReLU(),
+                            nn.Conv2d(self.hidden_dims[0], out_channels=self.in_channels,
+                                      kernel_size= 3, padding= 1),
+                            nn.Tanh())
+
+    def encode(self, input):
+        """
+        Encodes the input by passing through the encoder network
+        and returns the latent codes.
+        :param input: (Tensor) Input tensor to encoder [N x C x H x W]
+        :return: (Tensor) List of latent codes
+        """
+        result = self.encoder(input)
+        result = torch.flatten(result, start_dim=1)
+
+        # Split the result into mu and var components
+        # of the latent Gaussian distribution
+        mu = self.fc_mu(result)
+        log_var = self.fc_var(result)
+
+        return [mu, log_var]
+
+    def decode(self, z):
+        """
+        Maps the given latent codes
+        onto the image space.
+        :param z: (Tensor) [B x D]
+        :return: (Tensor) [B x C x H x W]
+        """
+        result = self.decoder_input(z)
+        result = result.view(-1, self.hidden_dims[-1], 2, 2)
+        result = self.decoder(result)
+        result = self.final_layer(result)
+        return result
+
+    def reparameterize(self, mu, logvar):
+        """
+        Reparameterization trick to sample from N(mu, var) from
+        N(0,1).
+        :param mu: (Tensor) Mean of the latent Gaussian [B x D]
+        :param logvar: (Tensor) Standard deviation of the latent Gaussian [B x D]
+        :return: (Tensor) [B x D]
+        """
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return eps * std + mu
+
+    def forward(self, input, **kwargs):
+        mu, log_var = self.encode(input)
+        z = self.reparameterize(mu, log_var)
+        return  [self.decode(z), input, mu, log_var]
+
+    def loss_function(self,
+                      *args,
+                      **kwargs) -> dict:
+        """
+        Computes the VAE loss function.
+        KL(N(\mu, \sigma), N(0, 1)) = \log \frac{1}{\sigma} + \frac{\sigma^2 + \mu^2}{2} - \frac{1}{2}
+        :param args:
+        :param kwargs:
+        :return:
+        """
+        recons = args[0]
+        input = args[1]
+        mu = args[2]
+        log_var = args[3]
+
+        kld_weight = kwargs['M_N'] # Account for the minibatch samples from the dataset
+        recons_loss =F.mse_loss(recons, input)
+
+
+        kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
+
+        loss = recons_loss + kld_weight * kld_loss
+        return {'loss': loss, 'Reconstruction_Loss':recons_loss.detach(), 'KLD':-kld_loss.detach()}
+
+    def sample(self,
+               num_samples:int,
+               current_device: int, **kwargs):
+        """
+        Samples from the latent space and return the corresponding
+        image space map.
+        :param num_samples: (Int) Number of samples
+        :param current_device: (Int) Device to run the model
+        :return: (Tensor)
+        """
+        z = torch.randn(num_samples,
+                        self.latent_dim)
+
+        z = z.to(current_device)
+
+        samples = self.decode(z)
+        return samples
+
+    def generate(self, x, **kwargs):
+        """
+        Given an input image x, returns the reconstructed image
+        :param x: (Tensor) [B x C x H x W]
+        :return: (Tensor) [B x C x H x W]
+        """
+
+        return self.forward(x)[0]

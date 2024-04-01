@@ -338,7 +338,7 @@ if __name__ == '__main__':
     depth = 6
     dim_head = 64
     heads = 12 # heads * dim_head = 12 * 64 = 768
-    timesteps = 1000
+    timesteps = 100
     prior_network = VersatileDiffusionPriorNetwork(
         dim=out_dim,
         depth=depth,
@@ -541,8 +541,12 @@ if __name__ == '__main__':
                 recons_mse = F.mse_loss(preds, voxel)
                 recons_corr = pearson(preds, voxel)
                 # recons_corr_loss = (1 - recons_corr**2).mean()
-                recons_corr_loss = dino_loss(preds, voxel, temp=soft_loss_temps[epoch])
+                # recons_corr_loss = dino_loss(preds, voxel, temp=soft_loss_temps[epoch])
 
+                # recons_loss = 0.1 * recons_mse + recons_corr_loss
+                # recons_loss = recons_loss.to(device)
+                recons_mse = torch.tensor(0)
+                recons_corr_loss =  1 - torch.nanmean(utils.pairwise_pearson_correlation(preds+(torch.randn_like(preds)*1e-8), voxel))
                 recons_loss = 0.1 * recons_mse + recons_corr_loss
                 recons_loss = recons_loss.to(device)
                 

@@ -94,6 +94,17 @@ def batchwise_pearson_correlation(Z, B):
     pearson_correlation = (numerator / denominator)
     return pearson_correlation
 
+def pairwise_pearson_correlation(x, y):
+    x=x.T; y=y.T
+    mean_x = torch.mean(x, dim=1, keepdim=True)
+    mean_y = torch.mean(y, dim=1, keepdim=True)
+    xm = x - mean_x
+    ym = y - mean_y
+    r_num = torch.sum(xm * ym, dim=1)
+    r_den = torch.norm(xm, dim=1) * torch.norm(ym, dim=1)
+    r_val = r_num / r_den
+    return r_val
+
 def batchwise_cosine_similarity(Z,B):
     # https://www.h4pz.co/blog/2021/4/2/batch-cosine-similarity-in-pytorch-or-numpy-jax-cupy-etc
     B = B.T
@@ -130,6 +141,17 @@ def mixco(voxels, beta=0.15, s_thresh=0.5):
         voxels_shuffle[select] * (1 - betas[select]).reshape(*betas_shape)
     betas[~select] = 1
     return voxels, perm, betas, select
+
+# def mixco_img(image, beta=0.15, s_thresh=0.5):
+#     perm = torch.randperm(image.shape[0])
+#     image_shuffle = image[perm].to(image.device,dtype=image.dtype)
+#     betas = torch.distributions.Beta(beta, beta).sample([image.shape[0]]).to(image.device,dtype=image.dtype)
+#     select = (torch.rand(image.shape[0]) <= s_thresh).to(image.device)
+#     betas_shape = [-1] + [1]*(len(image.shape)-1)
+#     image[select] = image[select] * betas[select].reshape(*betas_shape) + \
+#         voxels_shuffle[select] * (1 - betas[select]).reshape(*betas_shape)
+#     betas[~select] = 1
+#     return voxels, perm, betas, select
 
 def mixco_clip_target(clip_target, perm, select, betas):
     clip_target_shuffle = clip_target[perm]
@@ -211,6 +233,83 @@ def select_annotations(annots, random=False):
     txt = txt.flatten()
     return txt
 
+def mod_repeat(tensor, index, new):
+    orig = tensor.shape[index]
+    if orig == new:
+        return tensor
+    assert orig < new
+    expanded = [-1] * len(tensor.shape)
+    expanded[index] = orig * new//orig
+    tensor = tensor.expand(expanded)
+    if new%orig != 0:
+        tensor = torch.stack([tensor, tensor[:(new%orig)]], dim=index)
+    return tensor
+
+
+def eeg_collation_fn(samples, combine_tensors=True, combine_scalars=True):
+    """Take a collection of samples (dictionaries) and create a batch.
+
+    If `tensors` is True, `ndarray` objects are combined into
+    tensor batches.
+
+    :param dict samples: list of samples
+    :param bool tensors: whether to turn lists of ndarrays into a single ndarray
+    :returns: single sample consisting of a batch
+    :rtype: dict
+
+    """
+    assert isinstance(samples[0], (list, tuple)), type(samples[0])
+    batched = list(zip(*samples))
+    result = []
+    for b in batched:
+        max_len = max([elem.shape[0] for elem in b])
+        b = [mod_repeat(torch.tensor(elem), 0, max_len) for elem in b]
+        b = torch.stack(b)
+        result.append(b)
+    return result
+
+def get_dataloaders_eeg(
+    batch_size,
+    num_devices=None,
+    num_workers=None,
+    train_url=None,
+    val_url=None,
+    num_train=None,
+    cache_dir="/tmp/wds-cache",
+    seed=0,
+    val_batch_size=None,
+    local_rank=0,
+):
+    if local_rank==0: print("Getting dataloaders...")
+    
+    def my_split_by_node(urls):
+        return urls
+
+    global_batch_size = batch_size * num_devices
+    num_batches = math.floor(num_train / global_batch_size)
+    num_worker_batches = math.floor(num_batches / num_workers)
+
+    train_data = wds.WebDataset(train_url, resampled=False, cache_dir=cache_dir, nodesplitter=wds.split_by_node)\
+        .shuffle(500, initial=500, rng=random.Random(seed))\
+        .decode("torch")\
+        .rename(images="jpg;png", eeg="eeg.npy")\
+        .to_tuple("eeg", "images")\
+        .batched(batch_size, partial=False, collation_fn=eeg_collation_fn)\
+        .with_epoch(num_worker_batches)
+    train_dl = torch.utils.data.DataLoader(train_data, 
+                            num_workers=num_workers,
+                            batch_size=None, shuffle=False, persistent_workers=True)
+
+    val_data = wds.WebDataset(val_url, resampled=False, nodesplitter=wds.split_by_node)\
+        .decode("torch")\
+        .rename(images="jpg;png", eeg="eeg.npy")\
+        .to_tuple("eeg", "images")\
+        .batched(val_batch_size, partial=False, collation_fn=eeg_collation_fn)
+    val_dl = torch.utils.data.DataLoader(val_data, num_workers=1,
+                    batch_size=None, shuffle=False, persistent_workers=True)
+
+    return train_dl, val_dl, None, None
+
 def get_dataloaders(
     batch_size,
     num_devices=None,
@@ -265,6 +364,66 @@ def get_dataloaders(
         .decode("torch")\
         .rename(images="jpg;png", voxels="vert.npy", latent="clip_emb_hidden.npy")\
         .to_tuple("voxels", "images", "latent")\
+        .batched(val_batch_size, partial=False)
+    val_dl = torch.utils.data.DataLoader(val_data, num_workers=1,
+                    batch_size=None, shuffle=False, persistent_workers=True)
+
+    return train_dl, val_dl, num_train, num_val
+
+def get_dataloaders_wds2(
+    batch_size,
+    num_devices=None,
+    num_workers=None,
+    train_url=None,
+    val_url=None,
+    meta_url=None,
+    num_train=None,
+    num_val=None,
+    cache_dir="/tmp/wds-cache",
+    seed=0,
+    voxels_key="vert.npy",
+    val_batch_size=None,
+    local_rank=0,
+):
+    if local_rank==0: print("Getting dataloaders...")
+
+    metadata = json.load(open(meta_url))
+    if num_val is None:
+        num_val = 300
+    if num_train is None:
+        num_train = metadata['total'] - num_val
+
+    if local_rank==0: print('Prepping train and validation dataloaders...')
+    
+    def my_split_by_node(urls):
+        return urls
+
+    global_batch_size = batch_size * num_devices
+    num_batches = math.floor(num_train / global_batch_size)
+    num_worker_batches = math.floor(num_batches / num_workers)
+    
+    if local_rank==0: print("\nnum_train",num_train)
+    if local_rank==0: print("global_batch_size",global_batch_size)
+    if local_rank==0: print("num_batches",num_batches)
+
+    train_data = wds.WebDataset(train_url, resampled=False, cache_dir=cache_dir, nodesplitter=wds.split_by_node)\
+        .shuffle(500, initial=500, rng=random.Random(seed))\
+        .decode("torch")\
+        .rename(images="jpg;png", voxels="vert.npy")\
+        .to_tuple("voxels", "images")\
+        .batched(batch_size, partial=False)\
+        .with_epoch(num_worker_batches)
+    train_dl = torch.utils.data.DataLoader(train_data, 
+                            num_workers=min(num_workers, num_worker_batches),
+                            batch_size=None, shuffle=False, persistent_workers=True)
+    
+    if local_rank==0: print("\nnum_val", num_val)
+    if local_rank==0: print("val_batch_size", val_batch_size)
+
+    val_data = wds.WebDataset(val_url, resampled=False, nodesplitter=wds.split_by_node)\
+        .decode("torch")\
+        .rename(images="jpg;png", voxels="vert.npy")\
+        .to_tuple("voxels", "images")\
         .batched(val_batch_size, partial=False)
     val_dl = torch.utils.data.DataLoader(val_data, num_workers=1,
                     batch_size=None, shuffle=False, persistent_workers=True)
@@ -332,6 +491,149 @@ class DINOLoss(nn.Module):
     def update_center(self, targ):
         batch_center = targ.mean(dim=0, keepdim=True)
         self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
+
+@torch.no_grad()
+def sample_images(
+    clip_extractor, brain_net, sd_pipe, diffusion_prior, voxel, img_input, 
+    annotations=None,
+    num_inference_steps=50,
+    clip_guidance_scale=7.5,
+    vox_guidance_scale=7.5,
+    num_per_sample=4,
+    prior_timesteps=None,
+    seed=None,
+    verbose=True,
+    device='cuda',
+):
+
+    def null_sync(t, *args, **kwargs):
+        return [t]
+
+    def convert_imgs_for_fid(imgs):
+        # Convert from [0, 1] to [0, 255] and from torch.float to torch.uint8
+        return imgs.mul(255).add(0.5).clamp(0, 255).type(torch.uint8)
+    
+    assert voxel.shape[0] == img_input.shape[0], 'batch dim must be the same for voxels and images'
+    n_examples = voxel.shape[0]
+
+    clip_extractor.eval()
+    brain_net.eval()
+    if diffusion_prior is not None:
+        diffusion_prior.eval()
+
+    if seed is not None:
+        # set seed
+        g_cuda = torch.Generator(device=device)
+        g_cuda.manual_seed(seed)
+
+    # for brain guided images (specific to 512 x 512 generation size)
+    latents = torch.randn([num_per_sample, 4, 64, 64], device=device, generator=g_cuda)
+    
+    # use the same latent as the first brain guided image for max similarity
+    # clip_latents = torch.randn([1, 4, 64, 64], device=device, generator=g_cuda)
+    clip_latents = latents[0].unsqueeze(0).clone()
+
+    grids = []
+
+    for idx in range(n_examples):
+        print('sampling for image', idx+1, 'of', n_examples, flush=True)
+
+        img_orig = img_input[[idx]]
+        image = clip_extractor.resize_image(img_orig)
+
+        # Original clip embedding:
+        if annotations is None:
+            clip_emb = clip_extractor.embed_image(image, apply_transforms=False)
+        else:
+            print('Sampling with CLIP text guidance')
+            # random=False will use the first prompt here, which could be different from training 
+            # but should be the same during validation
+            annots = select_annotations(annotations[[idx]], random=False)
+            clip_emb = clip_extractor.embed_text(annots)
+
+        # clip_emb = sd_pipe._encode_image(tform(image), device, 1, False).squeeze(1)
+        norm_orig = clip_emb.norm().item()
+
+        # Encode voxels to CLIP space
+        image_embeddings = brain_net(voxel[[idx]].to(device).float())
+        if brain_net.use_projector:
+            # tuple of mse embeds and contrastive embeds
+            image_embeddings = image_embeddings[0]
+        image_embeddings = image_embeddings[:,0]
+        norm_pre_prior = image_embeddings.norm().item()
+        
+        # image_embeddings = nn.functional.normalize(image_embeddings, dim=-1) 
+        # image_embeddings *= clip_emb[1].norm()/image_embeddings.norm() # note: this is cheating to equate norm scaling
+
+        if diffusion_prior is not None:
+            image_embeddings = diffusion_prior.p_sample_loop(image_embeddings.shape, 
+                                                text_cond = dict(text_embed = image_embeddings), 
+                                                cond_scale = 1., timesteps = prior_timesteps,
+                                                generator=g_cuda
+                                                )
+            if image_embeddings.ndim == 3:
+                image_embeddings = image_embeddings[:, 0]
+            norm_post_prior = image_embeddings.norm().item()
+
+        if verbose:
+            cos_sim = nn.functional.cosine_similarity(image_embeddings, clip_emb, dim=1).item()
+            mse = nn.functional.mse_loss(image_embeddings, clip_emb).item()
+            print(f"cosine sim: {cos_sim:.3f}, MSE: {mse:.5f}, norm_orig: {norm_orig:.3f}, "
+                  f"norm_pre_prior: {norm_pre_prior:.3f}" + \
+                  f", norm_post_prior: {norm_post_prior:.3f}" if diffusion_prior is not None else "",
+                  flush=True)
+
+        # duplicate the embedding to serve classifier free guidance
+        image_embeddings = image_embeddings.repeat(num_per_sample, 1)
+        image_embeddings = torch.cat([torch.zeros_like(image_embeddings), image_embeddings]).unsqueeze(1).to(device)
+
+        # duplicate the embedding to serve classifier free guidance
+        clip_emb = torch.cat([torch.zeros_like(clip_emb), clip_emb]).unsqueeze(1).to(device).float()        
+
+        # TODO: passing sizes doesn't seem to work, so we're using None for now
+        # width, height = 256, 256
+        width, height = None, None
+
+        with torch.inference_mode(), torch.autocast(device):
+            # [1, 3, 512, 512]
+            img_clip = sd_pipe(
+                image_embeddings=clip_emb,
+                num_inference_steps=num_inference_steps,
+                num_images_per_prompt=1,
+                guidance_scale=clip_guidance_scale, 
+                latents=clip_latents,
+                width=width,
+                height=height,
+                generator=g_cuda,
+            )
+
+            # [4, 3, 512, 512]
+            imgs_brain = sd_pipe(
+                image_embeddings=image_embeddings,
+                num_inference_steps=num_inference_steps,
+                num_images_per_prompt=num_per_sample,
+                guidance_scale=vox_guidance_scale,
+                latents=latents,
+                width=width,
+                height=height,
+                generator=g_cuda,
+            )
+
+            # print('img_clip.shape', img_clip.shape)
+            # print('imgs_brain.shape', imgs_brain.shape)
+        
+        # resizing for now since passing target sizes into sd_pipe doesn't work
+        size = img_orig.shape[-2:]
+        img_clip = nn.functional.interpolate(img_clip, size, mode="area", antialias=False)
+        imgs_brain = nn.functional.interpolate(imgs_brain, size, mode="area", antialias=False)
+        
+        imgs_all = torch.cat((img_orig.to(device), img_clip, imgs_brain), 0)
+        grid = torch_to_Image(
+            make_grid(imgs_all, nrow=2+num_per_sample, padding=10).detach()
+        )
+        grids.append(grid)
+
+    return grids, None
 
 @torch.no_grad()
 def vd_sample_images(
